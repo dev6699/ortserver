@@ -1,0 +1,20 @@
+services:
+  ortserver:
+    build:
+      context: .
+    image: ortserver:local
+    container_name: ortserver
+    environment:
+      ORTSERVER_MODEL_ROOT: /models
+      ORTSERVER_HOST: 0.0.0.0
+      ORTSERVER_PORT: 18500
+      ORTSERVER_METRICS_HOST: 0.0.0.0
+      ORTSERVER_METRICS_PORT: 9090
+      ORTSERVER_MAX_MESSAGE_MB: 16
+      ORTSERVER_RELOAD_INTERVAL_SECONDS: 1
+      ORTSERVER_LOG_PREDICT: "false"
+    ports:
+      - "18500:18500"
+      - "9090:9090"
+    volumes:
+      - ./models:/models:ro

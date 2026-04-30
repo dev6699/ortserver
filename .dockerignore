@@ -1,0 +1,7 @@
+build/
+.git/
+.gitignore
+*.onnx
+*.tgz
+__pycache__/
+.venv/
