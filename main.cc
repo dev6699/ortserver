@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <malloc.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -149,6 +151,20 @@ static std::string escape_prom_label(const std::string& value) {
   }
   out.push_back('"');
   return out;
+}
+
+static int64_t current_rss_bytes() {
+  std::ifstream statm("/proc/self/statm");
+  long pages = 0;
+  long resident = 0;
+  if (!(statm >> pages >> resident)) {
+    return 0;
+  }
+  long page_size = ::sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(resident) * static_cast<int64_t>(page_size);
 }
 
 static int64_t now_micros(const Clock::time_point& started) {
@@ -731,8 +747,32 @@ class ModelStore {
     options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
     options.SetIntraOpNumThreads(intra_threads_);
     options.SetInterOpNumThreads(inter_threads_);
+    options.DisableCpuMemArena();
+    options.DisableMemPattern();
 
-    auto model = std::make_shared<LoadedModel>();
+    // ORT keeps a process-wide cache of pre-packed operator weights (e.g.
+    // transposed GEMM matrices) shared across all sessions in the same Env.
+    // The cache key is based on weight content, so when a model version changes
+    // the old entries are never evicted — they accumulate indefinitely, which
+    // causes the "large RSS growth on first few reloads, then minor" pattern.
+    //
+    // Disabling weight sharing means each session owns its pre-packed weights
+    // privately and they are freed exactly when the session is destroyed,
+    // giving us deterministic memory reclamation on every version change.
+    options.AddConfigEntry("session.use_env_allocators", "0");
+    options.DisablePerSessionThreads();
+    options.AddConfigEntry("session.disable_prepacking", "1");
+
+    // Allocate with a custom deleter so malloc_trim(0) is called immediately
+    // after the LoadedModel (and its Ort::Session) is destroyed, regardless of
+    // which thread drops the last shared_ptr reference.  This ensures freed ORT
+    // arena pages are returned to the OS even when an in-flight inference holds
+    // the shared_ptr past the ReloadOnce swap point.
+    auto* raw = new LoadedModel();
+    std::shared_ptr<LoadedModel> model(raw, [](LoadedModel* p) {
+      delete p;           // Ort::Session destructor frees arena back to glibc
+      ::malloc_trim(0);   // glibc returns those free pages to the OS
+    });
     auto [name, version] = parse_model_name_version(model_path);
     model->name = name;
     model->version = version;
@@ -767,6 +807,7 @@ class ModelStore {
   }
 
   void ReloadOnce(bool initial_load) {
+    const int64_t rss_before = current_rss_bytes();
     auto discovered = discover_model_paths(model_root_);
     std::map<std::string, fs::path> latest_paths;
     std::map<std::string, int64_t> latest_versions;
@@ -784,20 +825,87 @@ class ModelStore {
       throw std::runtime_error("no ONNX models found under " + model_root_.string());
     }
 
+    // Take a snapshot of current versions to decide what needs (re)loading.
+    // Use a local scope so we release these shared_ptrs before loading new
+    // models — holding them across LoadModel() doubles peak RSS unnecessarily.
+    std::map<std::string, std::shared_ptr<LoadedModel>> current_versions;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      current_versions = versions_;
+    }
+
+    if (!initial_load && current_versions.size() == latest_paths.size()) {
+      bool unchanged = true;
+      for (const auto& [name, model_path] : latest_paths) {
+        auto it = current_versions.find(name);
+        if (it == current_versions.end() || it->second->version != latest_versions[name] ||
+            it->second->model_path != model_path) {
+          unchanged = false;
+          break;
+        }
+      }
+      if (unchanged) {
+        return;
+      }
+    }
+
     std::map<std::string, std::shared_ptr<LoadedModel>> new_versions;
     for (const auto& [name, model_path] : latest_paths) {
+      auto it = current_versions.find(name);
+      if (it != current_versions.end() && it->second->version == latest_versions[name] &&
+          it->second->model_path == model_path) {
+        // Reuse the existing session — move the shared_ptr so current_versions
+        // no longer holds a reference to it, allowing the old map to be freed
+        // as soon as possible rather than pinning sessions until end-of-function.
+        new_versions[name] = std::move(it->second);
+        continue;
+      }
       auto model = LoadModel(model_path);
       new_versions[name] = std::move(model);
     }
 
+    // Release remaining entries in current_versions (models that were replaced
+    // or removed) *before* the swap so that, when the old sessions are finally
+    // evicted from versions_ below, their refcount can drop to zero immediately
+    // instead of being kept alive by this local copy until end-of-function.
+    current_versions.clear();
+
     std::map<std::string, int64_t> previous_versions;
+    std::map<std::string, std::shared_ptr<LoadedModel>> stale_versions;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       for (const auto& [name, model] : versions_) {
         previous_versions[name] = model->version;
       }
       versions_.swap(new_versions);
+      // new_versions now holds the old/stale sessions. Move them out of the
+      // lock so we can destroy them (potentially blocking on ORT teardown)
+      // without holding mutex_, keeping the critical section short.
+      stale_versions = std::move(new_versions);
     }
+
+    // Destroy old sessions outside the lock.  This is where ORT frees model
+    // weights, thread pools, and arena buffers — it can be slow for large
+    // models, so we must not block Get() callers during this teardown.
+    stale_versions.clear();
+
+    // ORT's arena allocator does a single large mmap and suballocates from it.
+    // When the session is destroyed the arena is freed back to glibc, but
+    // glibc holds those pages in its free list rather than returning them to
+    // the OS — so RSS stays elevated even though the memory is logically free.
+    // malloc_trim(0) forces glibc to release any free pages at the top of the
+    // heap and to return any free mmap'd regions, which is what actually brings
+    // RSS down after a version change.
+    ::malloc_trim(0);
+
+    const int64_t rss_after = current_rss_bytes();
+    log_line("info", "reload_rss", {
+                                      {"initial_load", initial_load ? "true" : "false"},
+                                      {"rss_before_bytes", std::to_string(rss_before)},
+                                      {"rss_after_bytes", std::to_string(rss_after)},
+                                      {"rss_delta_bytes", std::to_string(rss_after - rss_before)},
+                                      {"loaded_models", std::to_string(versions_.size())},
+                                  });
 
     if (!initial_load) {
       for (const auto& [name, model] : versions_) {
@@ -1117,7 +1225,16 @@ int main(int argc, char** argv) {
       args.intra_threads = default_intra_threads();
     }
 
-    Ort::Env env(ORT_LOGGING_LEVEL_ERROR, "ort_grpc");
+    // Use a global thread pool in the Env so sessions created with
+    // DisablePerSessionThreads() share a single pool rather than each spawning
+    // and leaking their own intra/inter-op threads on every version reload.
+    OrtThreadingOptions* tp_opts_raw = nullptr;
+    Ort::ThrowOnError(Ort::GetApi().CreateThreadingOptions(&tp_opts_raw));
+    Ort::ThrowOnError(Ort::GetApi().SetGlobalIntraOpNumThreads(tp_opts_raw, args.intra_threads));
+    Ort::ThrowOnError(Ort::GetApi().SetGlobalInterOpNumThreads(tp_opts_raw, args.inter_threads));
+    Ort::Env env(tp_opts_raw, ORT_LOGGING_LEVEL_ERROR, "ort_grpc");
+    Ort::GetApi().ReleaseThreadingOptions(tp_opts_raw);
+
     ModelStore store(env, args.model_root, args.intra_threads, args.inter_threads, args.reload_interval_seconds);
     MetricsRegistry metrics;
     MetricsHttpServer metrics_server(args.metrics_host, args.metrics_port, metrics);
