@@ -8,14 +8,17 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <iomanip>
 #include <condition_variable>
+#include <limits>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -621,74 +624,124 @@ static Ort::Value create_ort_tensor(const ortserver::v1::Tensor& tensor, ONNXTen
   }
 }
 
-static ortserver::v1::Tensor ort_value_to_tensor(const std::string& name, const Ort::Value& value) {
+static int checked_protobuf_repeated_size(size_t count) {
+  if (count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("tensor is too large to encode in a protobuf repeated field");
+  }
+  return static_cast<int>(count);
+}
+
+static size_t checked_tensor_bytes(size_t count, size_t element_size) {
+  if (element_size != 0 && count > std::numeric_limits<size_t>::max() / element_size) {
+    throw std::runtime_error("tensor byte size overflow");
+  }
+  return count * element_size;
+}
+
+static size_t tensor_element_size(ONNXTensorElementDataType dtype) {
+  switch (dtype) {
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+      return sizeof(float);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+      return sizeof(uint16_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+      return sizeof(int32_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+      return sizeof(int64_t);
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+      return sizeof(uint8_t);
+    default:
+      throw std::runtime_error("unsupported tensor element type");
+  }
+}
+
+static size_t ort_value_tensor_bytes(const Ort::Value& value) {
+  auto info = value.GetTensorTypeAndShapeInfo();
+  return checked_tensor_bytes(static_cast<size_t>(info.GetElementCount()), tensor_element_size(info.GetElementType()));
+}
+
+template <typename T, typename RepeatedField>
+static void copy_tensor_data_to_repeated(const T* data, size_t count, RepeatedField* repeated) {
+  const int protobuf_count = checked_protobuf_repeated_size(count);
+  repeated->Resize(protobuf_count, T{});
+  if (count > 0) {
+    std::memcpy(repeated->mutable_data(), data, checked_tensor_bytes(count, sizeof(T)));
+  }
+}
+
+static void fill_tensor_from_ort_value(const std::string& name, const Ort::Value& value,
+                                       ortserver::v1::Tensor* tensor) {
+  tensor->Clear();
+
   auto info = value.GetTensorTypeAndShapeInfo();
   auto shape = info.GetShape();
   auto dtype = info.GetElementType();
   auto count = static_cast<size_t>(info.GetElementCount());
 
-  ortserver::v1::Tensor tensor;
-  tensor.set_name(name);
+  tensor->set_name(name);
   for (int64_t dim : shape) {
-    tensor.add_shape(dim);
+    tensor->add_shape(dim);
   }
 
   switch (dtype) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
-      tensor.set_datatype("FP32");
-      const float* data = value.GetTensorData<float>();
-      tensor.mutable_fp32_data()->Reserve(static_cast<int>(count));
-      for (size_t i = 0; i < count; ++i) {
-        tensor.add_fp32_data(data[i]);
-      }
-      return tensor;
+      tensor->set_datatype("FP32");
+      copy_tensor_data_to_repeated(value.GetTensorData<float>(), count, tensor->mutable_fp32_data());
+      return;
     }
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: {
-      tensor.set_datatype("FP16");
+      tensor->set_datatype("FP16");
       const Ort::Float16_t* data = value.GetTensorData<Ort::Float16_t>();
-      std::string raw;
-      raw.resize(count * sizeof(uint16_t));
+      std::string* raw = tensor->mutable_raw_data();
+      raw->resize(checked_tensor_bytes(count, sizeof(uint16_t)));
+      char* raw_data = raw->data();
       for (size_t i = 0; i < count; ++i) {
         uint16_t bits;
         std::memcpy(&bits, &data[i], sizeof(bits));
-        raw[i * 2] = static_cast<char>(bits & 0xFF);
-        raw[i * 2 + 1] = static_cast<char>((bits >> 8) & 0xFF);
+        raw_data[i * 2] = static_cast<char>(bits & 0xFF);
+        raw_data[i * 2 + 1] = static_cast<char>((bits >> 8) & 0xFF);
       }
-      tensor.set_raw_data(raw);
-      return tensor;
+      return;
     }
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: {
-      tensor.set_datatype("INT32");
-      const int32_t* data = value.GetTensorData<int32_t>();
-      tensor.mutable_int32_data()->Reserve(static_cast<int>(count));
-      for (size_t i = 0; i < count; ++i) {
-        tensor.add_int32_data(data[i]);
-      }
-      return tensor;
+      tensor->set_datatype("INT32");
+      copy_tensor_data_to_repeated(value.GetTensorData<int32_t>(), count, tensor->mutable_int32_data());
+      return;
     }
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
-      tensor.set_datatype("INT64");
-      const int64_t* data = value.GetTensorData<int64_t>();
-      tensor.mutable_int64_data()->Reserve(static_cast<int>(count));
-      for (size_t i = 0; i < count; ++i) {
-        tensor.add_int64_data(data[i]);
-      }
-      return tensor;
+      tensor->set_datatype("INT64");
+      copy_tensor_data_to_repeated(value.GetTensorData<int64_t>(), count, tensor->mutable_int64_data());
+      return;
     }
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8: {
-      tensor.set_datatype("UINT8");
+      tensor->set_datatype("UINT8");
       const uint8_t* data = value.GetTensorData<uint8_t>();
-      std::string raw;
-      raw.resize(count);
-      for (size_t i = 0; i < count; ++i) {
-        raw[i] = static_cast<char>(data[i]);
-      }
-      tensor.set_raw_data(raw);
-      return tensor;
+      std::string* raw = tensor->mutable_raw_data();
+      raw->assign(reinterpret_cast<const char*>(data), count);
+      return;
     }
     default:
       throw std::runtime_error("unsupported output type");
   }
+}
+
+static size_t saturating_add_size(size_t lhs, size_t rhs) {
+  if (rhs > std::numeric_limits<size_t>::max() - lhs) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return lhs + rhs;
+}
+
+static size_t input_storage_bytes(const std::vector<InputStorage>& storages) {
+  size_t total = 0;
+  for (const auto& storage : storages) {
+    total = saturating_add_size(total, checked_tensor_bytes(storage.fp32.size(), sizeof(float)));
+    total = saturating_add_size(total, checked_tensor_bytes(storage.fp16.size(), sizeof(Ort::Float16_t)));
+    total = saturating_add_size(total, checked_tensor_bytes(storage.int32.size(), sizeof(int32_t)));
+    total = saturating_add_size(total, checked_tensor_bytes(storage.int64.size(), sizeof(int64_t)));
+    total = saturating_add_size(total, checked_tensor_bytes(storage.uint8.size(), sizeof(uint8_t)));
+  }
+  return total;
 }
 
 class ModelStore {
@@ -960,14 +1013,40 @@ class ModelStore {
 
 class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
  public:
-  OrtServiceImpl(const ModelStore& store, MetricsRegistry& metrics, bool log_predict)
-      : store_(store), metrics_(metrics), log_predict_(log_predict) {}
+  OrtServiceImpl(const ModelStore& store, MetricsRegistry& metrics, bool log_predict, bool trim_after_predict,
+                 size_t trim_after_predict_threshold_bytes, int trim_after_predict_interval)
+      : store_(store),
+        metrics_(metrics),
+        log_predict_(log_predict),
+        trim_after_predict_(trim_after_predict),
+        trim_after_predict_threshold_bytes_(trim_after_predict_threshold_bytes),
+        trim_after_predict_interval_(trim_after_predict_interval) {}
 
   grpc::Status Predict(grpc::ServerContext* context, const ortserver::v1::PredictRequest* request,
                        ortserver::v1::PredictResponse* response) override {
     auto started = Clock::now();
     auto decode_started = started;
     auto run_started = started;
+
+    struct PredictMemoryReclaimGuard {
+      const OrtServiceImpl* service = nullptr;
+      size_t transient_bytes = 0;
+      bool reclaimed = false;
+
+      void AddBytes(size_t bytes) {
+        transient_bytes = saturating_add_size(transient_bytes, bytes);
+      }
+
+      void ReclaimNow() {
+        if (!reclaimed && service != nullptr) {
+          service->trim_inference_allocations(transient_bytes);
+          reclaimed = true;
+        }
+      }
+
+      ~PredictMemoryReclaimGuard() { ReclaimNow(); }
+    } reclaim{this};
+
     try {
       if (request->model_spec().name().empty()) {
         auto ended = Clock::now();
@@ -999,12 +1078,12 @@ class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
       input_values.reserve(model->input_names.size());
       std::vector<const char*> input_names;
       input_names.reserve(model->input_names.size());
+      const Ort::MemoryInfo input_memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
       if (model->input_names.size() == 1 && request->inputs_size() == 1) {
         const auto& input = request->inputs().begin()->second;
         storages.emplace_back();
-        input_values.push_back(create_ort_tensor(input, model->input_types[0], storages.back(),
-                                                 Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)));
+        input_values.push_back(create_ort_tensor(input, model->input_types[0], storages.back(), input_memory_info));
         input_names.push_back(model->input_names[0].c_str());
       } else if (request->inputs_size() == static_cast<int>(model->input_names.size())) {
         std::unordered_map<std::string, const ortserver::v1::Tensor*> resolved;
@@ -1019,8 +1098,7 @@ class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
             return grpc::Status(grpc::INVALID_ARGUMENT, "missing request input: " + model->input_names[i]);
           }
           storages.emplace_back();
-          input_values.push_back(create_ort_tensor(*it->second, model->input_types[i], storages.back(),
-                                                   Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)));
+          input_values.push_back(create_ort_tensor(*it->second, model->input_types[i], storages.back(), input_memory_info));
           input_names.push_back(model->input_names[i].c_str());
         }
       } else {
@@ -1028,6 +1106,8 @@ class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
         record_predict(model->name, version_key, "400", started, started, started, ended, "invalid_argument");
         return grpc::Status(grpc::INVALID_ARGUMENT, "unable to map request inputs to model inputs");
       }
+
+      reclaim.AddBytes(input_storage_bytes(storages));
 
       auto decode_done = Clock::now();
       run_started = decode_done;
@@ -1041,15 +1121,35 @@ class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
       auto ort_outputs = model->session.Run(Ort::RunOptions{nullptr}, input_names.data(), input_values.data(),
                                            input_values.size(), output_names.data(), output_names.size());
       auto run_done = Clock::now();
+      if (ort_outputs.size() != model->output_names.size()) {
+        throw std::runtime_error("ORT returned unexpected output count");
+      }
+
+      size_t output_tensor_bytes = 0;
+      for (const auto& output : ort_outputs) {
+        output_tensor_bytes = saturating_add_size(output_tensor_bytes, ort_value_tensor_bytes(output));
+      }
+      reclaim.AddBytes(output_tensor_bytes);
 
       auto* response_model_spec = response->mutable_model_spec();
       response_model_spec->set_name(model->name);
       response_model_spec->set_version(std::to_string(model->version));
       response_model_spec->set_signature_name(request->model_spec().signature_name());
 
+      auto* response_outputs = response->mutable_outputs();
       for (size_t i = 0; i < ort_outputs.size(); ++i) {
-        (*response->mutable_outputs())[output_names[i]] = ort_value_to_tensor(output_names[i], ort_outputs[i]);
+        auto& output_tensor = (*response_outputs)[model->output_names[i]];
+        fill_tensor_from_ort_value(model->output_names[i], ort_outputs[i], &output_tensor);
       }
+
+      // Drop per-request ORT output buffers and copied input buffers before
+      // returning to gRPC. Without this explicit release + trim step, glibc can
+      // keep large transient inference allocations in the process RSS long after
+      // each unary RPC has completed, which looks like a leak under sustained load.
+      ort_outputs.clear();
+      input_values.clear();
+      storages.clear();
+      reclaim.ReclaimNow();
 
       auto ended = Clock::now();
       record_predict(model_key, version_key, "200", started, decode_done, run_done, ended, "");
@@ -1070,6 +1170,26 @@ class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
   }
 
  private:
+  void trim_inference_allocations(size_t transient_bytes) const {
+    if (!trim_after_predict_) {
+      return;
+    }
+
+    const uint64_t request_index = predict_request_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool over_threshold = transient_bytes >= trim_after_predict_threshold_bytes_;
+    const bool due_interval =
+        trim_after_predict_interval_ > 0 &&
+        request_index % static_cast<uint64_t>(trim_after_predict_interval_) == 0;
+
+    if (over_threshold || due_interval) {
+      bool expected = false;
+      if (trim_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        ::malloc_trim(0);
+        trim_in_progress_.store(false, std::memory_order_release);
+      }
+    }
+  }
+
   void record_predict(const std::string& model, const std::string& version, const std::string& status,
                       const Clock::time_point& started, const Clock::time_point& decode_done,
                       const Clock::time_point& run_done, const Clock::time_point& ended,
@@ -1095,6 +1215,11 @@ class OrtServiceImpl final : public ortserver::v1::OrtService::Service {
   const ModelStore& store_;
   MetricsRegistry& metrics_;
   bool log_predict_;
+  bool trim_after_predict_;
+  size_t trim_after_predict_threshold_bytes_;
+  int trim_after_predict_interval_;
+  mutable std::atomic<uint64_t> predict_request_count_{0};
+  mutable std::atomic<bool> trim_in_progress_{false};
 };
 
 struct Args {
@@ -1109,6 +1234,9 @@ struct Args {
   int inter_threads = 1;
   int reload_interval_seconds = 60;
   bool log_predict = false;
+  bool trim_after_predict = true;
+  int trim_after_predict_threshold_mb = 64;
+  int trim_after_predict_interval = 256;
 };
 
 static const char* env_or_null(const char* name) {
@@ -1180,6 +1308,15 @@ static Args parse_args(int argc, char** argv) {
   if (auto value = env_bool("ORTSERVER_LOG_PREDICT")) {
     args.log_predict = *value;
   }
+  if (auto value = env_bool("ORTSERVER_TRIM_AFTER_PREDICT")) {
+    args.trim_after_predict = *value;
+  }
+  if (auto value = env_int("ORTSERVER_TRIM_AFTER_PREDICT_MB")) {
+    args.trim_after_predict_threshold_mb = *value;
+  }
+  if (auto value = env_int("ORTSERVER_TRIM_AFTER_PREDICT_INTERVAL")) {
+    args.trim_after_predict_interval = *value;
+  }
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -1211,6 +1348,14 @@ static Args parse_args(int argc, char** argv) {
       args.reload_interval_seconds = std::stoi(consume(arg));
     } else if (arg == "--log-predict") {
       args.log_predict = true;
+    } else if (arg == "--trim-after-predict") {
+      args.trim_after_predict = true;
+    } else if (arg == "--no-trim-after-predict") {
+      args.trim_after_predict = false;
+    } else if (arg == "--trim-after-predict-mb") {
+      args.trim_after_predict_threshold_mb = std::stoi(consume(arg));
+    } else if (arg == "--trim-after-predict-interval") {
+      args.trim_after_predict_interval = std::stoi(consume(arg));
     } else {
       throw std::runtime_error("unknown argument: " + arg);
     }
@@ -1224,6 +1369,14 @@ int main(int argc, char** argv) {
     if (args.intra_threads <= 0) {
       args.intra_threads = default_intra_threads();
     }
+    if (args.trim_after_predict_threshold_mb < 0) {
+      throw std::runtime_error("--trim-after-predict-mb must be >= 0");
+    }
+    if (args.trim_after_predict_interval < 0) {
+      throw std::runtime_error("--trim-after-predict-interval must be >= 0");
+    }
+    const size_t trim_after_predict_threshold_bytes = checked_tensor_bytes(
+        static_cast<size_t>(args.trim_after_predict_threshold_mb), static_cast<size_t>(1024 * 1024));
 
     // Use a global thread pool in the Env so sessions created with
     // DisablePerSessionThreads() share a single pool rather than each spawning
@@ -1238,7 +1391,8 @@ int main(int argc, char** argv) {
     ModelStore store(env, args.model_root, args.intra_threads, args.inter_threads, args.reload_interval_seconds);
     MetricsRegistry metrics;
     MetricsHttpServer metrics_server(args.metrics_host, args.metrics_port, metrics);
-    OrtServiceImpl service(store, metrics, args.log_predict);
+    OrtServiceImpl service(store, metrics, args.log_predict, args.trim_after_predict,
+                           trim_after_predict_threshold_bytes, args.trim_after_predict_interval);
 
     std::string server_address = args.host + ":" + std::to_string(args.port);
     grpc::ServerBuilder builder;
@@ -1254,6 +1408,9 @@ int main(int argc, char** argv) {
                                          {"reload_interval_seconds", std::to_string(args.reload_interval_seconds)},
                                          {"max_message_mb", std::to_string(args.max_message_mb)},
                                          {"log_predict", args.log_predict ? "true" : "false"},
+                                         {"trim_after_predict", args.trim_after_predict ? "true" : "false"},
+                                         {"trim_after_predict_mb", std::to_string(args.trim_after_predict_threshold_mb)},
+                                         {"trim_after_predict_interval", std::to_string(args.trim_after_predict_interval)},
                                      });
     server->Wait();
   } catch (const std::exception& ex) {
